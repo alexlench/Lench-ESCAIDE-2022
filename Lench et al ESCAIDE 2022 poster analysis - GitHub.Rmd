@@ -1,0 +1,707 @@
+---
+title: "Lench et al 2022 ESCAIDE"
+author: "Alex Lench"
+date: '2022-11-11'
+output: html_document
+---
+
+```{r Setup, include=FALSE}
+
+
+# Loading packages
+
+library(janitor)
+library(tidyverse)
+library(RODBC)
+library(haven)
+library(flextable)
+library(broom)
+library(lmtest)
+
+
+# Setting start and end dates of analysis
+
+Start_date <- as.Date("2021-05-01")
+End_date_deliveries <- as.Date("2022-04-01")
+End_date_vaccination <- as.Date("2022-09-01")
+
+
+# Reading in deliveries data and supplemented vaccination data, renaming columns
+# [Section censored for GitHub]
+
+
+# Removing entries from deliveries (child births) data: deliveries outside analysis dates, multiples and second deliveries (minimal)
+  
+Deliveries_data <- Deliveries_data %>%
+
+  filter(Child_Birth_Date >= Start_date & Child_Birth_Date < End_date_deliveries) %>%
+  
+  filter(Birth_Order == 1) %>% 
+  
+  group_by(NHS_Number) %>% 
+  arrange(Child_Birth_Date) %>%
+  mutate(dup=row_number()) %>%
+  ungroup() %>%
+  filter(dup==1) %>%
+  select(-dup)
+
+
+# Adding calculated fields to deliveries data
+
+Deliveries_data <- Deliveries_data %>%
+  
+  mutate(ApproxConceptionDate=as.Date(Child_Birth_Date)-(Labour_Onset_Gestation_Weeks*7))
+
+
+# Joining deliveries data and supplemented vaccination data by NHS number
+
+Combined_data <- Deliveries_data %>% 
+  
+  inner_join(Vaccination_supp_data, by = "NHS_Number")
+
+
+# Adding calculated fields etc to combined data
+
+Combined_data <- Combined_data %>%
+
+  mutate(Vacc1=if_else(Vaccination1_Date<=End_date_vaccination,1,0)) %>%
+  mutate(Vacc2=if_else(Vaccination2_Date<=End_date_vaccination,1,0)) %>%
+  
+  mutate(Vacc1_at_delivery=if_else(Vaccination1_Date<=Child_Birth_Date,1,0)) %>%
+  mutate(Vacc2_at_delivery=if_else(Vaccination2_Date<=Child_Birth_Date,1,0)) %>%
+
+  mutate(Vacc1_during_preg=if_else(Vaccination1_Date<=Child_Birth_Date & Vaccination1_Date>=ApproxConceptionDate,1,0)) %>%
+  mutate(Vacc2_during_preg=if_else(Vaccination2_Date<=Child_Birth_Date & Vaccination2_Date>=ApproxConceptionDate,1,0)) %>%
+
+  mutate(Vacc1_prior_preg=if_else(Vaccination1_Date<ApproxConceptionDate,1,0)) %>%
+  mutate(Vacc2_prior_preg=if_else(Vaccination2_Date<ApproxConceptionDate,1,0)) %>%
+  
+  mutate(Prior_during_denom=if_else(is.na(ApproxConceptionDate),0,1)) %>%
+
+  mutate(Delivery_Month=format(as.Date(Child_Birth_Date),"%Y-%m")) %>%
+  
+  mutate(Mothers_Age=as.numeric(trunc(((as.Date(Child_Birth_Date)-as.Date(Date_of_Birth))/365.25),0))) %>%
+  
+  mutate(Mothers_Age_Group=if_else(Mothers_Age<20,"<20",
+                               if_else(Mothers_Age>19 & Mothers_Age<30,"20-29",
+                                       if_else(Mothers_Age>29 & Mothers_Age<40,"30-39", 
+                                               if_else(Mothers_Age>39,"40+", "Unknown")))),
+         Mothers_Age_Group=if_else(is.na(Mothers_Age),"Unknown", Mothers_Age_Group)) %>%
+
+  mutate(On_Shielding_List=if_else(On_Shielding_List=="Y","Yes",
+                                 if_else(On_Shielding_List=="N","No","Unknown"))) %>%
+ 
+  select(Child_Birth_Date, Delivery_Month, Vacc1, Vacc2, Vacc1_at_delivery, Vacc2_at_delivery, Vacc1_prior_preg, Vacc2_prior_preg, 
+         Vacc1_during_preg, Vacc2_during_preg, Prior_during_denom, Mothers_Age, Mothers_Age_Group, Deprivation_Quintile, 
+         Health_Board_Residence, On_Shielding_List) %>%
+  
+  mutate_at(c('Vacc1','Vacc2','Vacc1_at_delivery','Vacc2_at_delivery'), ~replace_na(.,0))
+
+
+# Producing summary data for vaccination by month of delivery
+
+Summary_by_month_data <- Combined_data %>%
+  
+  mutate_at(c('Vacc1_prior_preg', 'Vacc2_prior_preg','Vacc1_during_preg','Vacc2_during_preg'), ~replace_na(.,0)) %>%
+
+  group_by(Delivery_Month) %>%
+  
+  summarize(TotalDeliveries=n(),
+            Prior_during_denom=sum(Prior_during_denom),
+            Vacc1_at_delivery=sum(Vacc1_at_delivery),
+            Vacc2_at_delivery=sum(Vacc2_at_delivery),
+            Vacc1_prior_preg=sum(Vacc1_prior_preg),
+            Vacc2_prior_preg=sum(Vacc2_prior_preg),
+            Vacc1_during_preg=sum(Vacc1_during_preg),
+            Vacc2_during_preg=sum(Vacc2_during_preg),
+            Vacc1=sum(Vacc1),
+            Vacc2=sum(Vacc2)) %>%
+  
+    adorn_totals("row") %>%
+
+    mutate(Vacc1_at_delivery_perc=100*(Vacc1_at_delivery/TotalDeliveries),
+           Vacc2_at_delivery_perc=100*(Vacc2_at_delivery/TotalDeliveries),
+           Vacc1_prior_preg_perc=100*(Vacc1_prior_preg/Prior_during_denom),
+           Vacc2_prior_preg_perc=100*(Vacc2_prior_preg/Prior_during_denom),
+           Vacc1_during_preg_perc=100*(Vacc1_during_preg/Prior_during_denom),
+           Vacc2_during_preg_perc=100*(Vacc2_during_preg/Prior_during_denom),
+           Vacc1_perc=100*(Vacc1/TotalDeliveries),
+           Vacc2_perc=100*(Vacc2/TotalDeliveries))
+
+
+# Setting theme for charts
+
+nice_chart <- list(
+    theme_minimal() +
+    theme(panel.grid.major.y = element_line(size=0.1, colour="grey"), 
+          panel.grid.minor = element_line(colour="white", size=0), 
+          panel.grid.major.x = element_blank()) +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1, size=20, margin = margin(b = 2), colour="black")) +  
+    theme(axis.text.y = element_text(size=20, margin = margin(l = 10), colour="black")) +  
+    theme(axis.title = element_text(size=21, face="bold")) +
+    theme(legend.text = element_text(color="black", size=20, face="italic", hjust=0)) +
+    theme(legend.title = element_text(color="black", size=20, face="italic", hjust=0)))
+
+
+# Flextable formatting
+
+flextable_format <- function(x) {
+  x <- x %>% 
+    align(align = "center", part = "all") %>%
+    valign(valign = "center", part = "all") %>%
+    font(fontname = 'Calibri', part = "all") %>%
+    fontsize(part = "all", size = 9) %>%
+    height_all(height = 0.25, part = "body") %>%
+    border_remove() %>%
+    hline(j = NULL, part = "header") %>%
+    hline_top(part = "header") %>%
+    hline()
+}
+
+
+# Defining generic function for frequency table/multivariable regression OR analyses
+
+Multivar_Freq_func <- function(func_data, func_data_baselines, func_outcome1, func_outcome2, func_explanatory_vars) {
+  
+  # Adjust in case of only 1 outcome variable or baselines not set
+  func_outcome2 <- ifelse(is.na(func_outcome2), func_outcome1, func_outcome2)
+  func_data_baselines <- if(is.data.frame(func_data_baselines)) func_data_baselines else func_data
+  
+  # Convert to factors
+  func_data <- func_data %>%
+    mutate_at(c(func_explanatory_vars),as.factor)
+  func_data_baselines <- func_data_baselines %>%
+    mutate_at(c(func_explanatory_vars),as.factor)
+  
+  # Drop rows of data with NA values in the outcome/explanatory variables, these are not included - assign value prior to analysis if needed 
+  func_data <- func_data %>%
+    drop_na(any_of(c(func_outcome1,func_outcome2,func_explanatory_vars)))
+  func_data_baselines <- func_data_baselines %>%
+    drop_na(any_of(c(func_outcome1,func_outcome2,func_explanatory_vars)))
+  
+  # Counts for outcome 1
+  outcome1_counts <- func_explanatory_vars %>% 
+    map(.f = 
+          ~{func_data %>%
+              group_by(.data[[func_outcome1[]]]) %>%     
+              count(.data[[all_of(.x)]]) %>%    
+              pivot_wider(              
+                names_from = .data[[func_outcome1[]]],
+                values_from = n) %>% 
+              drop_na(.data[[all_of(.x)]]) %>%         
+              rename(category = all_of(.x)) %>% 
+              mutate(category = as.character(category)) %>%
+              mutate(variable =.x)}) %>%
+    
+    bind_rows() %>%
+    mutate(term = paste0(variable,category)) %>%
+    rename(outcome1_N = "0", outcome1_Y = "1") %>%
+    mutate(outcome1_total = outcome1_N + outcome1_Y)
+  
+  # Multivariable regression for outcome 1
+  outcome1_multi <- func_explanatory_vars %>%
+    str_c(collapse = "+") %>%
+    str_c(paste0(func_outcome1," ~ "), .) %>%
+    glm(family = "binomial",
+        data = func_data_baselines) %>%
+    tidy(exponentiate = TRUE, conf.int = TRUE) %>%
+    
+    mutate(across(where(is.numeric), round, digits = 2)) %>%
+    mutate(outcome1_CI=paste0(sprintf("%.2f", conf.low),"-", sprintf("%.2f", conf.high))) %>%
+    rename(outcome1_OR=estimate, outcome1_CI_low=conf.low, outcome1_CI_high=conf.high)
+  
+  # Counts for outcome 2
+  outcome2_counts <- func_explanatory_vars %>% 
+    map(.f = 
+          ~{func_data %>%
+              group_by(.data[[func_outcome2[]]]) %>%     
+              count(.data[[all_of(.x)]]) %>%    
+              pivot_wider(              
+                names_from = .data[[func_outcome2[]]],
+                values_from = n) %>% 
+              drop_na(.data[[all_of(.x)]]) %>%         
+              rename(category = all_of(.x)) %>% 
+              mutate(category = as.character(category)) %>%
+              mutate(variable =.x)}) %>%
+    
+    bind_rows() %>%
+    mutate(term = paste0(variable,category)) %>%
+    rename(outcome2_N = "0", outcome2_Y = "1") %>%
+    mutate(outcome2_total = outcome2_N + outcome2_Y)
+  
+  # Multivariable regression for outcome 2
+  outcome2_multi <- func_explanatory_vars %>%
+    str_c(collapse = "+") %>%
+    str_c(paste0(func_outcome2," ~ "), .) %>%
+    glm(family = "binomial",
+        data = func_data_baselines) %>%
+    tidy(exponentiate = TRUE, conf.int = TRUE) %>%
+    
+    mutate(across(where(is.numeric), round, digits = 2)) %>%
+    mutate(outcome2_CI=paste0(sprintf("%.2f", conf.low),"-", sprintf("%.2f", conf.high))) %>%
+    rename(outcome2_OR=estimate, outcome2_CI_low=conf.low, outcome2_CI_high=conf.high)
+  
+  # Join count and regression data
+  multivar_freq <- outcome1_counts %>%
+    left_join(outcome1_multi, by = "term") %>%
+    left_join(outcome2_counts, by = "term") %>%
+    left_join(outcome2_multi, by = "term")
+  
+  # Generate final fields and refining data frame
+  multivar_freq <- multivar_freq %>%
+    mutate(outcome1_total = format(round(as.numeric(outcome1_total), 0), nsmall=0, big.mark=",")) %>%
+    mutate(outcome1_Y = format(round(as.numeric(outcome1_Y), 0), nsmall=0, big.mark=",")) %>%
+    mutate(outcome1_OR_CI = paste0(sprintf(outcome1_OR, fmt = '%#.2f'), " (", outcome1_CI, ")")) %>%
+    mutate(outcome2_Y = format(round(as.numeric(outcome2_Y), 0), nsmall=0, big.mark=",")) %>%
+    mutate(outcome2_OR_CI = paste0(sprintf(outcome2_OR, fmt = '%#.2f'), " (", outcome2_CI, ")")) %>%
+    select(variable.x, category.x, outcome1_total, outcome1_Y, outcome1_OR_CI, outcome2_Y, outcome2_OR_CI) %>%
+    mutate_all(~replace(., . == "NA (NA)", "*")) %>%
+    rename(variable=variable.x, category=category.x, n=outcome1_total) %>%
+    rename(!!paste0(func_outcome1,"_n"):=outcome1_Y) %>%
+    rename(!!paste0(func_outcome1,"_OR"):=outcome1_OR_CI) %>%
+    rename(!!if_else(func_outcome1==func_outcome2,"Dup1",paste0(func_outcome2,"_n")):=outcome2_Y) %>%
+    rename(!!if_else(func_outcome1==func_outcome2,"Dup2",paste0(func_outcome2,"_OR")):=outcome2_OR_CI) %>%
+    select(-any_of(c("Dup1","Dup2")))
+  
+  return(multivar_freq)
+  
+}
+
+```
+
+
+```{r Table of vaccination by month of delivery (table 1), echo=FALSE}
+
+
+# Producing data for table 1 from summary data for vaccination by month of delivery
+
+Table1 <-  Summary_by_month_data %>%
+
+  mutate(TotalDeliveries = format(round(as.numeric(TotalDeliveries), 0), nsmall=0, big.mark=","),
+         Vacc1_at_delivery = format(round(as.numeric(Vacc1_at_delivery), 0), nsmall=0, big.mark=","),
+         Vacc2_at_delivery = format(round(as.numeric(Vacc2_at_delivery), 0), nsmall=0, big.mark=","),
+         Vacc1 = format(round(as.numeric(Vacc1), 0), nsmall=0, big.mark=","),
+         Vacc2 = format(round(as.numeric(Vacc2), 0), nsmall=0, big.mark=","),
+         
+         Vacc1_at_delivery_perc = sprintf(Vacc1_at_delivery_perc, fmt = '%#.1f'),
+         Vacc2_at_delivery_perc = sprintf(Vacc2_at_delivery_perc, fmt = '%#.1f'),
+         Vacc1_perc = sprintf(Vacc1_perc, fmt = '%#.1f'),
+         Vacc2_perc = sprintf(Vacc2_perc, fmt = '%#.1f')) %>%
+  
+  mutate(Vacc1_at_delivery_n_perc =  paste0(Vacc1_at_delivery, " (", Vacc1_at_delivery_perc, "%)"),
+         Vacc2_at_delivery_n_perc =  paste0(Vacc2_at_delivery, " (", Vacc2_at_delivery_perc, "%)"),
+         Vacc1_n_perc =  paste0(Vacc1, " (", Vacc1_perc, "%)"),
+         Vacc2_n_perc =  paste0(Vacc2, " (", Vacc2_perc, "%)")) %>%
+         
+  select(Delivery_Month, TotalDeliveries, Vacc1_at_delivery_n_perc, Vacc2_at_delivery_n_perc, Vacc1_n_perc, Vacc2_n_perc)
+
+
+# Converting table 1 data frame to table
+
+Table1 <- Table1 %>%
+    
+    flextable() %>%
+    
+      set_header_labels(Vacc1_at_delivery_n_perc = "Dose 1",
+                        Vacc2_at_delivery_n_perc = "Dose 2",
+                        Vacc1_n_perc = "Dose 1",
+                        Vacc2_n_perc = "Dose 2") %>%
+      add_header_row(values = c("Delivery month", "No. women delivered", "Women vaccinated by delivery of child", 
+                                paste("Women vaccinated as at", format(End_date_vaccination, "%d/%m/%Y"), sep=" ")),
+                     colwidths = c(1, 1, 2, 2), top = TRUE) %>%
+      merge_at(i = c(1:2), j = 1, part = "header") %>%
+      merge_at(i = c(1:2), j = 2, part = "header") %>%
+      # merge_at(i = c(1:2), j = 7, part = "header") %>%
+      width(j = c(3:6), width = 1) %>%
+      width(j = 1, width = 0.7) %>%
+      width(j = 2, width = 0.7) %>%
+      flextable_format
+
+Table1
+
+```
+
+<br/>
+
+```{r Bar charts of vaccination by month of delivery (figure 1), echo=FALSE}
+
+
+# Producing long data for figure 1a (dose 1) from summary data for vaccination by month of delivery
+
+Figure1a <-  Summary_by_month_data %>%
+  
+  filter(Delivery_Month != "Total") %>%
+  
+  select(Delivery_Month, Vacc1_prior_preg_perc, Vacc1_during_preg_perc) %>%
+  
+  rename(`Prior` = Vacc1_prior_preg_perc, `During` = Vacc1_during_preg_perc) %>%
+  
+  gather(`Dose 1`, uptake, `Prior`, `During`, factor_key=TRUE)
+
+
+# Producing bar chart from data frame
+
+Figure1a <- ggplot(data = Figure1a, mapping = aes(x=Delivery_Month, fill=`Dose 1`, y=uptake)) +
+            scale_y_continuous(limits = c(0,100), breaks = seq(0,100,10), labels=waiver()) +
+            geom_col(color="black", width=0.8) +
+            scale_fill_manual(values=c("#325083","#E03882")) +
+            labs(x="Delivery month", y = "% Vacc. by Delivery") +
+            nice_chart 
+
+
+# Producing long data for figure 1b (dose 2) from summary data for vaccination by month of delivery
+
+Figure1b <-  Summary_by_month_data %>%
+  
+  filter(Delivery_Month != "Total") %>%
+  
+  select(Delivery_Month, Vacc2_prior_preg_perc, Vacc2_during_preg_perc) %>%
+  
+  rename(`Prior` = Vacc2_prior_preg_perc, `During` = Vacc2_during_preg_perc) %>%
+  
+  gather(`Dose 2`, uptake, `Prior`, `During`, factor_key=TRUE)
+
+
+# Producing bar chart from data frame
+
+Figure1b <- ggplot(data = Figure1b, mapping = aes(x=Delivery_Month, fill=`Dose 2`, y=uptake)) +
+            scale_y_continuous(limits = c(0,100), breaks = seq(0,100,10), labels=waiver()) +
+            geom_col(color="black", width=0.8) +
+            scale_fill_manual(values=c("#28B8CE","#4EBC68")) +
+            labs(x="Delivery month", y = "% Vacc. by Delivery") +
+            nice_chart 
+
+Figure1a
+Figure1b
+
+```
+
+<br/>
+
+```{r Regression analysis on determinants of uptake (Table 2), echo=FALSE}
+
+  
+# Defining variables of interest
+
+Table2_explanatory_vars <- c("Mothers_Age_Group", "Deprivation_Quintile", "Health_Board_Residence", "On_Shielding_List")
+
+
+# Dropping rows with missing information for variables of interest
+
+Table2_data <- Combined_data %>%
+
+  filter(Mothers_Age_Group != "Unknown") %>%
+
+  filter(Health_Board_Residence != "Outside Wales" &
+         Health_Board_Residence != "Unknown")
+
+
+# Setting baselines for multivariable regression - note. least deprived (quintile 5) set as baseline
+
+Table2_data_baselines <- Table2_data %>% 
+  
+  mutate(Mothers_Age_Group = fct_relevel(Mothers_Age_Group, "30-39", after = 0)) %>%
+  mutate(Deprivation_Quintile=ifelse(Deprivation_Quintile==5,0,Deprivation_Quintile))
+
+
+# Pass to frequency/multivariable regression function
+
+Table2_raw <- Multivar_Freq_func(Table2_data, Table2_data_baselines, "Vacc1_at_delivery", "Vacc2_at_delivery", Table2_explanatory_vars)
+
+
+# Finalising data frame
+
+Table2 <- Table2_raw %>%  
+
+  # rename(variable="variable.x", category="category.x") %>%
+    
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="1","Most Deprived",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="2","Dep. Quint. 2",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="3","Dep. Quint. 3",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="4","Dep. Quint. 4",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="5","Least Deprived",category)) %>%
+  
+  mutate(variable=if_else(variable=="Mothers_Age_Group","Age Group",variable)) %>%
+  mutate(variable=if_else(variable=="Deprivation_Quintile","Deprivation Quintile",variable)) %>%
+  mutate(variable=if_else(variable=="Health_Board_Residence","Health Board",variable)) %>%
+  mutate(variable=if_else(variable=="On_Shielding_List","Shielding",variable))
+
+
+# Converting table 2 data frame to table
+
+Table2 <- Table2 %>%
+
+    flextable() %>%
+    
+      set_header_labels(Vacc1_at_delivery_n = "n",
+                        Vacc1_at_delivery_OR = "aOR (95% CI)",
+                        Vacc2_at_delivery_n = "n",
+                        Vacc2_at_delivery_OR = "aOR (95% CI)") %>%
+      add_header_row(values = c("Variable", "Category", "n", "Dose 1 by Delivery", "Dose 2 by Delivery"), 
+                     colwidths = c(1, 1, 1, 2, 2), top = TRUE) %>%
+  flextable_format %>%
+      merge_at(i = c(1:2), j = 1, part = "header") %>%
+      merge_at(i = c(1:2), j = 2, part = "header") %>%
+      merge_at(i = c(1:2), j = 3, part = "header") %>%
+      merge_at(i = c(1:4), j = 1, part = "body") %>%
+      merge_at(i = c(5:9), j = 1, part = "body") %>%
+      merge_at(i = c(10:16), j = 1, part = "body") %>%
+      merge_at(i = c(17:18), j = 1, part = "body") %>%
+      width(j = c(3:7), width = 1.0) %>%
+      width(j = 1, width = 0.8) %>%
+      width(j = 2, width = 1.0) %>%
+      width(j = 3, width = 0.8) %>%
+      flextable_format
+
+Table2
+
+```
+
+<br/>
+
+```{r Table of most deprived deprivation quintile OR for pregnancy vs control (Table 3), echo=FALSE}
+
+
+# Subsetting vaccination data for assessments of deprivation impact on coverage in all women (comparator)
+
+Comparator_data <- Vaccination_supp_data %>%
+  
+  filter(Sex=="F") %>%
+  
+  select(Date_of_Birth, Vaccination1_Date, Vaccination2_Date, Deprivation_Quintile, Health_Board_Residence, On_Shielding_List)
+
+
+# Setting point dates for comparators
+
+point1_date <- as.Date("2021-04-15")
+point2_date <- as.Date("2021-06-15")
+
+
+# Defining variables of interest
+
+Table3_explanatory_vars <- c("Age_Group", "Deprivation_Quintile", "Health_Board_Residence", "On_Shielding_List")
+
+
+# Initiating table 3 data frame using relevant result from data for table 2 
+
+Table3 <- Table2_raw %>%
+  
+  mutate(Analysis="Vaccination by delivery for women delivering 01/05/21 to 31/03/22") %>%
+  
+  filter(variable=="Deprivation_Quintile" & category==1) %>%
+  
+  rename(Vacc1_n=Vacc1_at_delivery_n, Vacc1_OR=Vacc1_at_delivery_OR, Vacc2_n=Vacc2_at_delivery_n, Vacc2_OR=Vacc2_at_delivery_OR)
+
+  Table3$n <- nrow(Table2_data)
+  Table3$Vacc1_overall_perc <- 100*(sum(Table2_data$Vacc1_at_delivery)/nrow(Table2_data))
+  Table3$Vacc2_overall_perc <- 100*(sum(Table2_data$Vacc2_at_delivery)/nrow(Table2_data))
+  
+
+# Producing comparator data for each point estimate
+
+x <- c(point1_date, point2_date)
+
+for (point_date in x) {
+
+  ## Producing age groups and subsetting data for 16-50 year olds  
+  
+  Comparator_data_temp <- Comparator_data %>%
+      
+    mutate(Age=as.numeric(trunc(((as.Date(point_date)-as.Date(Date_of_Birth))/365.25),0))) %>%
+    
+    filter(Age>=16 & Age <= 50) %>%
+      
+    mutate(Age_Group=if_else(Age<20,"<20",
+                               if_else(Age>19 & Age<30,"20-29",
+                                       if_else(Age>29 & Age<40,"30-39", 
+                                               if_else(Age>39,"40+", "Unknown")))),
+           Age_Group=if_else(is.na(Age),"Unknown", Age_Group))
+
+  
+  ## Calculating vaccinations by point date etc
+  
+  Comparator_data_temp <- Comparator_data_temp %>%
+  
+    mutate(Vacc1=if_else(Vaccination1_Date<=as.Date(point_date),1,0)) %>%
+    mutate(Vacc2=if_else(Vaccination2_Date<=as.Date(point_date),1,0)) %>%
+    mutate_at(c('Vacc1','Vacc2'), ~replace_na(.,0))
+  
+     
+  ## Dropping rows with missing information for variables of interest
+  
+  Comparator_data_temp <- Comparator_data_temp %>%
+
+    filter(Age_Group != "Unknown") %>%
+    
+    filter(Health_Board_Residence != "Outside Wales" &
+              Health_Board_Residence != "Unknown")
+  
+  
+  ## Calculating coverage
+  
+  comp_vacc1coverage_perc_temp <- 100*(sum(Comparator_data_temp$Vacc1)/nrow(Comparator_data_temp))
+  comp_vacc2coverage_perc_temp <- 100*(sum(Comparator_data_temp$Vacc2)/nrow(Comparator_data_temp))
+  comp_n_temp <- nrow(Comparator_data_temp)
+  
+  
+  ## Setting baselines for multivariable regression - note. least deprived (quintile 5) set as baseline
+  
+  Comparator_data_temp_baselines <- Comparator_data_temp %>% 
+    
+    mutate(Age_Group = fct_relevel(Age_Group, "30-39", after = 0)) %>%
+    mutate(Deprivation_Quintile=ifelse(Deprivation_Quintile==5,0,Deprivation_Quintile))
+
+  
+  ## Pass to frequency/multivariable regression function
+  
+  Comparator_raw_temp <- Multivar_Freq_func(Comparator_data_temp, Comparator_data_temp_baselines, "Vacc1", "Vacc2", Table3_explanatory_vars)
+
+  
+  ## Selecting deprivation quintile 1 result, adding n number and coverage
+  
+  Comparator_raw_temp <- Comparator_raw_temp %>%
+        
+    mutate(Analysis=paste0("Women 16-50, coverage at ", format(as.Date(point_date), "%d/%m/%Y"))) %>%
+      
+    filter(variable=="Deprivation_Quintile" & category==1) %>%
+      
+    mutate(Vacc1_overall_perc=comp_vacc1coverage_perc_temp,
+           Vacc2_overall_perc=comp_vacc2coverage_perc_temp,
+           n=comp_n_temp)
+    
+    
+  ## Adding result to table 3 data
+    
+  Table3 <- Table3 %>%
+    
+    rbind(Comparator_raw_temp)
+    
+}
+
+
+# Finalise compiled data
+
+Table3 <- Table3 %>%
+  
+  mutate(Vacc1_overall_perc = paste0(sprintf(Vacc1_overall_perc, fmt = '%#.1f'),"%")) %>%
+  mutate(Vacc2_overall_perc = paste0(sprintf(Vacc2_overall_perc, fmt = '%#.1f'),"%")) %>%
+  
+  select(Analysis, n, Vacc1_overall_perc, Vacc1_OR, Vacc2_overall_perc, Vacc2_OR)
+  
+
+# Converting table 3 data frame to table
+
+Table3 <- Table3 %>%
+
+    flextable() %>%
+    
+      set_header_labels(Vacc1_overall_perc = "Overall % Dose received",
+                        Vacc1_OR = "aOR (95% CI) of Most Deprived Dep. Quint.",
+                        Vacc2_overall_perc = "Overall % Dose received",
+                        Vacc2_OR = "aOR (95% CI) of Most Deprived Dep. Quint.") %>%
+      add_header_row(values = c("Analysis", "n", "Dose 1", "Dose 2"), 
+                     colwidths = c(1, 1, 2, 2), top = TRUE) %>%
+      merge_at(i = c(1:2), j = 1, part = "header") %>%
+      merge_at(i = c(1:2), j = 2, part = "header") %>%
+      width(j = 1, width = 2.2) %>%
+      width(j = c(3,5), width = 1.0) %>%
+      width(j = c(4,6), width = 1.3) %>%
+      flextable_format
+
+Table3
+
+```
+
+<br/>
+
+```{r Regression analysis on determinants of delayed vaccination (Table 4), echo=FALSE}
+
+
+# Subsetting data for women delivering after june 2021 who haven't received dose 1 prior to pregnancy
+
+Table4_data <- Combined_data %>%
+  
+  filter(Child_Birth_Date>=as.Date("2021-06-01")) %>%
+  
+  filter(Vacc1_prior_preg==0)
+
+
+# Creating delayed vaccination flag - 0 if dose 1 after delivery, 1 if dose 1 during pregnancy
+
+Table4_data <- Table4_data %>%
+  
+  mutate(Non_Delayed_Vacc = if_else(Vacc1==1 & Vacc1_at_delivery==0, 0, NA_real_)) %>%
+  mutate(Non_Delayed_Vacc = if_else(Vacc1_at_delivery==1, 1, Non_Delayed_Vacc))
+
+
+# Defining variables of interest
+
+Table4_explanatory_vars <- c("Delivery_Month", "Mothers_Age_Group", "Deprivation_Quintile", "Health_Board_Residence", "On_Shielding_List")
+
+
+# Dropping rows with missing information for variables of interest
+
+Table4_data <- Table4_data %>%
+
+  filter(Mothers_Age_Group != "Unknown") %>%
+
+  filter(Health_Board_Residence != "Outside Wales" &
+         Health_Board_Residence != "Unknown")
+
+
+# Setting baselines for multivariable regression - note. least deprived (quintile 5) set as baseline
+
+Table4_data_baselines <- Table4_data %>% 
+  
+  mutate(Mothers_Age_Group = fct_relevel(Mothers_Age_Group, "30-39", after = 0)) %>%
+  mutate(Deprivation_Quintile=ifelse(Deprivation_Quintile==5,0,Deprivation_Quintile))
+
+
+# Pass to frequency/multivariable regression function
+  
+Table4 <- Multivar_Freq_func(Table4_data, Table4_data_baselines, "Non_Delayed_Vacc", NA, Table4_explanatory_vars)
+
+
+# Finalising data frame
+
+Table4 <- Table4 %>%  
+
+  mutate(n=as.numeric(gsub(',','',n))-as.numeric(gsub(',','',Non_Delayed_Vacc_n))) %>%
+  mutate(n=format(round(n, 0), nsmall=0, big.mark=",")) %>%
+
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="1","Most Deprived",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="2","Dep. Quint. 2",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="3","Dep. Quint. 3",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="4","Dep. Quint. 4",category)) %>%
+  mutate(category=if_else(variable=="Deprivation_Quintile" & category=="5","Least Deprived",category)) %>%
+  
+  mutate(variable=if_else(variable=="Delivery_Month","Delivery Month",variable)) %>%
+  mutate(variable=if_else(variable=="Mothers_Age_Group","Age Group",variable)) %>%
+  mutate(variable=if_else(variable=="Deprivation_Quintile","Deprivation Quintile",variable)) %>%
+  mutate(variable=if_else(variable=="Health_Board_Residence","Health Board",variable)) %>%
+  mutate(variable=if_else(variable=="On_Shielding_List","Shielding",variable))
+  
+
+# Converting table 4 data frame to table
+
+Table4 <- Table4 %>%
+
+    flextable() %>%
+    
+      set_header_labels(variable = "Variable",
+                        category = "Category",
+                        n = "Dose 1 after pregnancy n",
+                        Non_Delayed_Vacc_n = "Dose 1 during pregnancy n",
+                        Non_Delayed_Vacc_OR = "Dose 1 during vs after pregnancy aOR (95% CI)") %>%
+      merge_at(i = c(1:10), j = 1, part = "body") %>%
+      merge_at(i = c(11:14), j = 1, part = "body") %>%
+      merge_at(i = c(15:19), j = 1, part = "body") %>%
+      merge_at(i = c(20:26), j = 1, part = "body") %>%
+      merge_at(i = c(27:28), j = 1, part = "body") %>%
+      autofit() %>%
+      width(j = 1, width = 1.0) %>%
+      flextable_format()
+
+Table4
+
+```
